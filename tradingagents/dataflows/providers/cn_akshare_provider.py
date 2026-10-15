@@ -219,6 +219,10 @@ class CnAkshareProvider(BaseMarketDataProvider):
             "Amount": "Volume",
         }
         df = raw_df.rename(columns=col_map).copy()
+        # sina/tencent 同时返回 volume 与 amount，两者都被 col_map 映射为
+        # "Volume"，rename 后会出现重复列名，导致 df["Volume"] 变成 DataFrame、
+        # pd.to_numeric 抛 TypeError。保留第一个（真实成交量 volume），丢弃重复。
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
         required = ["Date", "Open", "High", "Low", "Close", "Volume"]
         missing = [c for c in required if c not in df.columns]
         if missing:
