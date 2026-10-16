@@ -192,6 +192,157 @@ class CnAkshareProvider(BaseMarketDataProvider):
         # 常见 A 股 ETF 代码段：5xxxxx(沪市) / 15xxxx,16xxxx,18xxxx(深市)
         return code.startswith(("5", "15", "16", "18"))
 
+    # ────────────────────────────────────────────────────────────────────────────────
+    # OHLCV 质量校验 & Volume 单位归一
+    # ────────────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_and_fix_ohlcv(
+        df: pd.DataFrame,
+        source_name: str | None = None,
+    ) -> tuple[pd.DataFrame, dict]:
+        """对已标准化 (Date/Open/High/Low/Close/Volume) 的 OHLCV 做质量校验。
+
+        三类问题按严重程度分级处理：
+          hard    —— 同一 bar 内部矛盾（High<Low / Open,Close 不在 [Low,High] / 价格<=0），
+                    直接丢弃该 bar。
+          soft    —— Volume 单位归一：腾讯源原生返回"手"，需 ×100 转"股"；新浪/东财已是股。
+                    优先按 source_name 显式识别，拿不到时再用价格无关的量级启发式兜底。
+          info    —— 无法自动修复的潜在脏数据（价格单日跳变远超 A 股涨跌停幅度），
+                    只记录告警，不丢弃——1996 年前无涨跌停、拆股除权都会导致跳空。
+
+        返回: (清洗后的 DataFrame, 校验报告 dict)
+        """
+        if df is None or df.empty:
+            return pd.DataFrame(), {"hard_dropped": 0, "soft_fixed": 0, "info_flags": 0}
+
+        out = df.copy()
+        hard_mask = pd.Series(False, index=out.index)
+        soft_fixed = 0
+        info_flags = 0
+
+        # ── hard 规则：单 bar 内部矛盾，直接丢弃 ──
+        hard_mask |= out["High"].notna() & out["Low"].notna() & (out["High"] < out["Low"])
+        low_valid = out["Low"].notna() & (out["Low"] > 0)
+        high_valid = out["High"].notna() & (out["High"] > 0)
+        hard_mask |= low_valid & high_valid & (
+            (out["Open"] < out["Low"]) | (out["Open"] > out["High"])
+        )
+        hard_mask |= low_valid & high_valid & (
+            (out["Close"] < out["Low"]) | (out["Close"] > out["High"])
+        )
+        hard_mask |= (out["Open"] <= 0) | (out["High"] <= 0) | (out["Low"] <= 0) | (out["Close"] <= 0)
+
+        dropped_count = int(hard_mask.sum())
+        if dropped_count > 0:
+            out = out.loc[~hard_mask].reset_index(drop=True)
+
+        # ── soft 规则：Volume 单位归一（手 ×100 → 股） ──
+        need_x100 = False
+        hand_sources = {"eastmoney", "tencent"}
+        if source_name in hand_sources:
+            # 东财/腾讯原生返回"手"，需 ×100 转"股"
+            need_x100 = True
+        elif source_name is None:
+            # 拿不到源名时用启发式兜底：看 Volume / Close 的中位数比例。
+            # 新浪/东财（股）：中盘股茅台 vol≈5e6 / close≈1300 ≈ 3800；
+            # 腾讯（手）：vol≈5e4 / close≈1300 ≈ 38，小了两个数量级。
+            # 阈值卡 1000：中位数 ratio < 100 → 腾讯量级，需要 ×100。
+            valid = (out["Close"] > 0) & (out["Volume"] > 0)
+            ratios = (out.loc[valid, "Volume"] / out.loc[valid, "Close"]).median() if valid.any() else 0
+            if 0 < ratios < 1000:
+                need_x100 = True
+        if need_x100 and not out.empty:
+            out["Volume"] = out["Volume"] * 100.0
+            soft_fixed = int(len(out))
+
+        # ── info 规则：单日涨跌远超 A 股涨跌停幅度（只告警，不丢弃） ──
+        if len(out) >= 2:
+            prev = out["Close"].shift(1)
+            curr = out["Close"]
+            valid = prev.notna() & curr.notna() & (prev > 0)
+            chg_pct = (curr - prev) / prev * 100
+            info_flags = int(((valid) & (chg_pct.abs() > 25)).sum())
+
+        report = {
+            "hard_dropped": dropped_count,
+            "soft_fixed": soft_fixed,
+            "info_flags": info_flags,
+            "rows_before": len(df),
+            "rows_after": len(out),
+            "source": source_name,
+        }
+        return out, report
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 单源探针：normalize → validate，返回 (df, report) 或 (空 df, err_msg)
+    # ────────────────────────────────────────────────────────────────────────────────
+
+    def _probe_source(
+        self,
+        raw_df: pd.DataFrame,
+        source_name: str,
+    ) -> tuple[pd.DataFrame, dict | None]:
+        """跑一遍 normalize + validate，干净返回 (df, report)，
+        质量不可接受（全空 / 全被 hard 丢弃）则返回 (空, report) 让上层换源。"""
+        try:
+            if raw_df is None or raw_df.empty:
+                return pd.DataFrame(), {"source": source_name, "error": "empty"}
+            norm = self._normalize_hist_df(raw_df)
+            if norm.empty:
+                return pd.DataFrame(), {"source": source_name, "error": "normalize 后空"}
+            fixed, report = self._validate_and_fix_ohlcv(norm, source_name=source_name)
+            report["source"] = source_name
+            report["ok"] = (not fixed.empty) and (report["rows_after"] >= max(1, report["rows_before"] - report["hard_dropped"]))
+            if report["hard_dropped"] > 0 and report["rows_after"] == 0:
+                report["ok"] = False
+                return pd.DataFrame(), report
+            return fixed, report
+        except Exception as exc:
+            return pd.DataFrame(), {"source": source_name, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 多源仲裁：如果不止一个源返回干净数据，选质量最高的那个
+    # ────────────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _arbitrate(sources: list[tuple[str, pd.DataFrame, dict]]) -> tuple[pd.DataFrame, dict]:
+        """sources = [(源名, DataFrame, report), ...]，返回 (最终 df, 综合报告)"""
+        PRIORITY = {"eastmoney": 0, "sina": 1, "tencent": 2}
+
+        # 1) 先挑 hard 丢弃最少的（质量最好）
+        clean = [(n, df, r) for (n, df, r) in sources if r.get("ok") and not df.empty]
+        if not clean:
+            # 全部失败，退回最后一个（哪怕是脏的），让上层拿到任何数据
+            last = sources[-1]
+            return last[1], last[2]
+        if len(clean) == 1:
+            chosen = clean[0]
+        else:
+            # 多源都干净 → 仲裁：选优先级最高（东财>新浪>腾讯），但若某源 Volume 修复过
+            # 另一源没，优先用没修复的；否则再看 hard_dropped 更少的。
+            def key(item):
+                n, df, r = item
+                return (
+                    PRIORITY.get(n, 99),
+                    r.get("soft_fixed", 0),     # 没修过 Volume 的优先
+                    r.get("hard_dropped", 0),
+                )
+            chosen = sorted(clean, key=key)[0]
+
+        chosen_df, chosen_report = chosen[1], chosen[2]
+        merged_report = {
+            "chosen_source": chosen[0],
+            "all_sources": [{"name": n, "report": r} for (n, df, r) in sources],
+            "final_rows": len(chosen_df),
+        }
+        merged_report.update({k: v for k, v in chosen_report.items() if k != "source"})
+        return chosen_df, merged_report
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 原 normalize，现在多走了一步 validate + Volume 归一
+    # ────────────────────────────────────────────────────────────────────────────────
+
     def _normalize_hist_df(self, raw_df: pd.DataFrame) -> pd.DataFrame:
         if raw_df is None or raw_df.empty:
             return pd.DataFrame()
@@ -275,6 +426,9 @@ class CnAkshareProvider(BaseMarketDataProvider):
         return df.head(rows).iloc[:, :cols]
 
     def _fetch_hist_df(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """质量驱动的多源 K 线拉取：
+        东财 → 新浪 → 腾讯，每个源都过 probe（normalize + validate），
+        只要当前源质量不达标就继续往下走；所有源跑完后用 _arbitrate 挑最好的。"""
         with AKSHARE_CALL_LOCK:
             ak = self._ak()
             code = self._normalize_symbol(symbol)
@@ -282,81 +436,89 @@ class CnAkshareProvider(BaseMarketDataProvider):
             start_yyyymmdd = start_date.replace("-", "")
             end_yyyymmdd = end_date.replace("-", "")
 
-            # ETF 优先：Sina 历史接口稳定且不依赖东财
+            # 收集所有源的 (名称, DataFrame, report)，最后交给 _arbitrate
+            collected: list[tuple[str, pd.DataFrame, dict]] = []
+            failures: list[str] = []   # 记录不可恢复的异常用于最终报错
+
+            # ── ETF：Sina 优先（更稳定），东财兜底 ──
             if self._is_likely_etf_symbol(symbol):
-                etf_errors = []
-                try:
-                    df = ak.fund_etf_hist_sina(symbol=symbol_with_market)
-                    out = self._normalize_hist_df(df)
-                    out = self._slice_hist_df(out, start_date, end_date)
-                    if not out.empty:
-                        return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
-                    etf_errors.append("fund_etf_hist_sina: empty after date filter")
-                except Exception as exc:
-                    etf_errors.append(f"fund_etf_hist_sina: {type(exc).__name__}")
+                for name, fetcher in [
+                    ("sina", lambda: ak.fund_etf_hist_sina(symbol=symbol_with_market)),
+                    ("eastmoney", lambda: ak.fund_etf_hist_em(
+                        symbol=code, period="daily",
+                        start_date=start_yyyymmdd, end_date=end_yyyymmdd, adjust="qfq")),
+                ]:
+                    try:
+                        df = fetcher()
+                        df = self._slice_hist_df(df, start_date, end_date) if df is not None else df
+                        fixed, report = self._probe_source(df, f"etf_{name}")
+                        collected.append((f"etf_{name}", fixed, report))
+                        if report.get("ok") and not fixed.empty:
+                            break
+                    except Exception as exc:
+                        failures.append(f"etf_{name}: {type(exc).__name__}: {str(exc)[:80]}")
+                if collected:
+                    chosen, arb_report = self._arbitrate(collected)
+                    if not chosen.empty:
+                        return self._maybe_append_realtime_row(symbol, chosen, end_date, assume_locked=True)
 
-                try:
-                    df = ak.fund_etf_hist_em(
-                        symbol=code,
-                        period="daily",
-                        start_date=start_yyyymmdd,
-                        end_date=end_yyyymmdd,
-                        adjust="qfq",
-                    )
-                    out = self._normalize_hist_df(df)
-                    if not out.empty:
-                        return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
-                    etf_errors.append("fund_etf_hist_em: empty dataframe")
-                except Exception as exc:
-                    etf_errors.append(f"fund_etf_hist_em: {type(exc).__name__}")
-
-            # Source 1: Eastmoney (default)
-            em_last_exc = None
+            # ── 股票三源（东财 → 新浪 → 腾讯） ──
+            # Source 1: Eastmoney（重试 2 次）
+            em_exc = None
             for i in range(2):
                 try:
                     df = ak.stock_zh_a_hist(
-                        symbol=code,
-                        period="daily",
-                        start_date=start_yyyymmdd,
-                        end_date=end_yyyymmdd,
-                        adjust="qfq",
+                        symbol=code, period="daily",
+                        start_date=start_yyyymmdd, end_date=end_yyyymmdd, adjust="qfq",
                     )
-                    out = self._normalize_hist_df(df)
-                    return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
+                    fixed, report = self._probe_source(df, "eastmoney")
+                    collected.append(("eastmoney", fixed, report))
+                    if report.get("ok") and not fixed.empty:
+                        # 东财质量好，可直接返回，但仍尝试拉新浪做仲裁
+                        break
+                    # 东财质量不达标 → 继续重试或换源
                 except Exception as exc:
-                    em_last_exc = exc
+                    em_exc = exc
                     if i < 1:
                         time.sleep(0.6 * (i + 1))
+                else:
+                    break
 
             # Source 2: Sina
             try:
                 df = ak.stock_zh_a_daily(
                     symbol=symbol_with_market,
-                    start_date=start_yyyymmdd,
-                    end_date=end_yyyymmdd,
-                    adjust="qfq",
+                    start_date=start_yyyymmdd, end_date=end_yyyymmdd, adjust="qfq",
                 )
-                out = self._normalize_hist_df(df)
-                return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
-            except Exception:
-                pass
+                fixed, report = self._probe_source(df, "sina")
+                collected.append(("sina", fixed, report))
+            except Exception as exc:
+                failures.append(f"sina: {type(exc).__name__}: {str(exc)[:80]}")
 
             # Source 3: Tencent
             try:
                 df = ak.stock_zh_a_hist_tx(
                     symbol=symbol_with_market,
-                    start_date=start_yyyymmdd,
-                    end_date=end_yyyymmdd,
-                    adjust="qfq",
+                    start_date=start_yyyymmdd, end_date=end_yyyymmdd, adjust="qfq",
                 )
-                out = self._normalize_hist_df(df)
-                return self._maybe_append_realtime_row(symbol, out, end_date, assume_locked=True)
-            except Exception:
-                pass
+                fixed, report = self._probe_source(df, "tencent")
+                collected.append(("tencent", fixed, report))
+            except Exception as exc:
+                failures.append(f"tencent: {type(exc).__name__}: {str(exc)[:80]}")
 
-            raise NotImplementedError(
-                f"cn_akshare is temporarily unavailable for price history (eastmoney/sina/tencent all failed): {em_last_exc}"
-            ) from em_last_exc
+            if not collected:
+                raise NotImplementedError(
+                    f"cn_akshare unavailable (all sources failed): "
+                    f"{'; '.join(failures) or str(em_exc)}"
+                ) from em_exc
+
+            chosen, arb_report = self._arbitrate(collected)
+            if chosen.empty:
+                raise NotImplementedError(
+                    f"cn_akshare unavailable (all sources returned dirty data or empty). "
+                    f"reports={[(n, r) for n, _, r in collected]}"
+                )
+            return self._maybe_append_realtime_row(symbol, chosen, end_date, assume_locked=True)
 
     def _fetch_realtime_row_unlocked(self, symbol: str) -> pd.DataFrame:
         ak = self._ak()
