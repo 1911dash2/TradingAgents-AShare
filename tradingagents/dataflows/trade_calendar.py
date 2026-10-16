@@ -54,6 +54,31 @@ def is_cn_trading_day(date_str: str) -> bool:
     return d.weekday() < 5
 
 
+def cn_trading_dates_between(start_str: str, end_str: str, step: int = 1) -> list[str]:
+    """返回 [start_str, end_str] 区间内的 A 股真实交易日列表。
+
+    step=1 逐日采样（默认），step=5 逐周（每周第一个交易日）。
+    优先用 akshare 官方交易日历（覆盖春节/国庆/清明等法定节假日），
+    拉不到时降级为周一至周五。
+    """
+    lo = _parse_date(start_str)
+    hi = _parse_date(end_str)
+    dates, _ = _load_cn_trade_dates()
+    if dates:
+        result = [d.strftime("%Y-%m-%d") for d in dates if lo <= d <= hi]
+    else:
+        # fallback: 只有周末规则
+        result = []
+        cur = lo
+        while cur <= hi:
+            if cur.weekday() < 5:
+                result.append(cur.strftime("%Y-%m-%d"))
+            cur = cur.fromordinal(cur.toordinal() + 1)
+    if step > 1:
+        result = result[::step]
+    return result
+
+
 def previous_cn_trading_day(date_str: str) -> str:
     d = _parse_date(date_str)
     dates, _ = _load_cn_trade_dates()

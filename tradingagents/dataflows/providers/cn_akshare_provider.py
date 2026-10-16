@@ -425,8 +425,102 @@ class CnAkshareProvider(BaseMarketDataProvider):
         cols = min(max_cols, len(df.columns))
         return df.head(rows).iloc[:, :cols]
 
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 磁盘缓存：一只股票一个 CSV（全历史前复权）
+    # 路径: {data_cache_dir}/a_share_daily/{symbol}_qfq.csv
+    # 列: Date,Open,High,Low,Close,Volume  (标准化后的 OHLCV)
+    # ────────────────────────────────────────────────────────────────────────────────
+
+    def _cache_filepath(self, symbol: str) -> str:
+        from tradingagents.dataflows.config import get_config
+        import os as _os
+        cache_dir = _os.path.join(get_config().get("data_cache_dir", "data"), "a_share_daily")
+        _os.makedirs(cache_dir, exist_ok=True)
+        safe = symbol.replace(".", "_").replace("/", "_")
+        return _os.path.join(cache_dir, f"{safe}_qfq.csv")
+
+    def _try_load_from_cache(self, symbol: str) -> pd.DataFrame | None:
+        """读磁盘缓存，返回 None 表示没有缓存或格式坏了。"""
+        import os as _os
+        path = self._cache_filepath(symbol)
+        if not _os.path.exists(path):
+            return None
+        try:
+            df = pd.read_csv(path)
+            if df.empty or "Date" not in df.columns:
+                return None
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+            return df
+        except Exception:
+            return None
+
+    def _save_to_cache(self, symbol: str, df: pd.DataFrame) -> None:
+        """把标准化 OHLCV DataFrame 存盘。df 必须有 Date/Open/High/Low/Close/Volume。"""
+        import os as _os
+        if df is None or df.empty:
+            return
+        out = df.copy()
+        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
+        out = out[["Date", "Open", "High", "Low", "Close", "Volume"]].sort_values("Date")
+        out.to_csv(self._cache_filepath(symbol), index=False)
+
+    def _merge_into_cache(self, symbol: str, online_df: pd.DataFrame) -> None:
+        """在线拉取结果增量合并进磁盘缓存（按 Date 去重，保留在线结果更新）。"""
+        import os as _os
+        existing = self._try_load_from_cache(symbol)
+        if existing is None or existing.empty:
+            self._save_to_cache(symbol, online_df)
+            return
+        new = online_df.copy()
+        new["Date"] = pd.to_datetime(new["Date"], errors="coerce")
+        merged = (
+            pd.concat([existing, new], ignore_index=True)
+            .drop_duplicates(subset=["Date"], keep="last")
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        self._save_to_cache(symbol, merged)
+
+    @staticmethod
+    def _cache_needs_refresh(cached_last_date: str, requested_end_date: str) -> bool:
+        """缓存最后日期 vs 请求结束日期 → True 表示需要在线补齐。
+        规则: 缓存覆盖到请求结束日期就够了（哪怕今天的数据还没收盘也不阻塞回测）。
+        只有当请求结束日期严格晚于缓存最后日期时才需要刷新。"""
+        try:
+            return pd.to_datetime(requested_end_date) > pd.to_datetime(cached_last_date)
+        except Exception:
+            return True
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 主入口：磁盘缓存优先，缓存缺失才走在线 fallback + 仲裁链
+    # ────────────────────────────────────────────────────────────────────────────────
+
     def _fetch_hist_df(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """质量驱动的多源 K 线拉取：
+        """磁盘缓存优先的 K 线拉取：
+        缓存够 → 直接切片返回；
+        缓存不够 → 在线拉（质量驱动 fallback + 仲裁）→ 增量合并进缓存 → 返回。"""
+        # 1) 磁盘缓存命中快路径
+        cached = self._try_load_from_cache(symbol)
+        if cached is not None and not cached.empty:
+            cached_last = cached["Date"].max().strftime("%Y-%m-%d")
+            if not self._cache_needs_refresh(cached_last, end_date):
+                hit = self._slice_hist_df(cached, start_date, end_date)
+                if not hit.empty:
+                    return hit
+
+        # 2) 在线拉（现有质量驱动 fallback + 仲裁链）
+        online_df = self._fetch_hist_df_online(symbol, start_date, end_date)
+
+        # 3) 增量合并进磁盘缓存
+        self._merge_into_cache(symbol, online_df)
+
+        # 4) 返回请求窗口的切片
+        out = self._slice_hist_df(online_df, start_date, end_date)
+        return out if not out.empty else online_df
+
+    def _fetch_hist_df_online(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """质量驱动的多源 K 线拉取（纯在线，不碰磁盘缓存）。
         东财 → 新浪 → 腾讯，每个源都过 probe（normalize + validate），
         只要当前源质量不达标就继续往下走；所有源跑完后用 _arbitrate 挑最好的。"""
         with AKSHARE_CALL_LOCK:
